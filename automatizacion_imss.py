@@ -15,6 +15,67 @@ def normalizar_texto(texto):
     t = "".join(c for c in unicodedata.normalize('NFD', t) if unicodedata.category(c) != 'Mn')
     return t
 
+# Mapeo de columna de rol (hoja administrativa) -> (valor_rol, nombre_rol) en MoCE
+MAPEO_ROL_COLUMNAS = {
+    'asistente medica': (1100, 'Asistente'),
+    'asistente medico': (1100, 'Asistente'),
+    'administrador de catalogo': (1500, 'Médico'),
+    'director': (1500, 'Médico'),
+    'jefes de servicios': (1500, 'Médico'),
+    'jefe de servicio': (1500, 'Médico'),
+    'agenda de citas': (1100, 'Asistente'),
+    'agenda citas': (1100, 'Asistente'),
+    'enfermera': (1400, 'Enfermera'),
+    'enfermero': (1400, 'Enfermera'),
+}
+
+def es_hoja_administrativa(hoja):
+    """Determina si la hoja corresponde a personal administrativo (u operativo)."""
+    h = normalizar_texto(hoja)
+    if 'operativ' in h:
+        return False
+    # 'admin' cubre variantes: 'administrativo', 'adminsitrativo' (typo), 'admin'
+    if 'admin' in h:
+        return True
+    return False
+
+def obtener_columnas_rol(df):
+    """Identifica las columnas que marcan el rol en la hoja de personal administrativo."""
+    palabras_clave = ['asistente', 'administrador', 'catalogo', 'director', 'jefe', 'agenda', 'enfermera', 'enfermero']
+    return [c for c in df.columns.tolist() if any(p in normalizar_texto(str(c)) for p in palabras_clave)]
+
+def detectar_rol_administrativo(row, columnas_rol):
+    """Detecta el rol de un usuario administrativo según la columna marcada con 'X'.
+    Devuelve (valor_rol, nombre_rol) o None si ningún rol viene marcado."""
+    for col in columnas_rol:
+        valor = row.get(col)
+        if pd.notna(valor) and normalizar_texto(str(valor)) in ('x', 'si', 'true', '1', 's', 'y', 'yes'):
+            clave = normalizar_texto(str(col))
+            for patron, rol in MAPEO_ROL_COLUMNAS.items():
+                if patron in clave:
+                    return rol
+    return None
+
+def rol_para_usuario(row, es_administrativo, columnas_rol=None):
+    """Devuelve (valor_rol, nombre_rol) según el tipo de hoja.
+    - Operativo: siempre Médico (1500).
+    - Administrativo: detecta la columna marcada con 'X'.
+    Devuelve (None, None) si es administrativo y no hay rol marcado."""
+    if es_administrativo:
+        return detectar_rol_administrativo(row, columnas_rol or [])
+    return (1500, 'Médico')
+
+def esperar_alerta(page, texto, timeout=8):
+    """Espera a que aparezca una alerta con el texto indicado en el contenedor <app-alert>.
+    Devuelve True si la alerta se mostró, False si no apareció dentro del tiempo límite."""
+    try:
+        page.locator("app-alert .alert-container .alert").filter(has_text=texto).wait_for(
+            state="visible", timeout=timeout * 1000
+        )
+        return True
+    except Exception:
+        return False
+
 # CONFIGURACIÓN POR DEFECTO
 URL_SISTEMA = 'https://ci-moceopd.imss.gob.mx/login'
 
@@ -145,6 +206,14 @@ def ejecutar_automatizacion():
         print(f"\n[+] Cargando datos de '{excel_file}' en la hoja '{hoja}'...")
         df = pd.read_excel(excel_file, sheet_name=hoja)
         
+        # Determinar si es la hoja de personal administrativo (cambia el rol por usuario)
+        columnas_rol = obtener_columnas_rol(df)
+        es_administrativo = es_hoja_administrativa(hoja) or bool(columnas_rol)
+        if es_administrativo:
+            print(f"[+] Hoja detectada como PERSONAL ADMINISTRATIVO. Columnas de rol: {columnas_rol}")
+        else:
+            print("[+] Hoja detectada como PERSONAL OPERATIVO. Todos los usuarios se darán de alta como Médico.")
+        
         # Obtener columnas a usar
         col_curp, col_nombre, col_matricula = obtener_columnas(df)
         
@@ -213,6 +282,16 @@ def ejecutar_automatizacion():
                 
             nombre = str(row[col_nombre]).strip()
             print(f"\n[*] [{exitosos+errores+1}/{len(df_medicos)}] Procesando: {nombre} | CURP: {curp}")
+
+            # Determinar rol según el tipo de hoja
+            rol_det = rol_para_usuario(row, es_administrativo, columnas_rol)
+            if rol_det is None:
+                print("    [!] No se detectó un rol marcado (X) para este usuario. Se omitirá.")
+                df.at[index, col_matricula] = "ERROR: Sin rol marcado"
+                errores += 1
+                continue
+            rol_value, rol_nombre = rol_det
+            print(f"    [i] Rol asignado: {rol_nombre} ({rol_value})")
 
             try:
                 # 1. Ingresar CURP de manera robusta
@@ -299,13 +378,14 @@ def ejecutar_automatizacion():
                     df.at[index, col_matricula] = matricula
                     exitosos += 1
                     
-                    # 4. Seleccionar Rol (Médico)
+                    # 4. Seleccionar Rol
                     try:
                         # Probamos con el selector Angular formcontrolname
                         try:
-                            page.select_option("select[formcontrolname='rol']", value="1500") # Médico = 1500
+                            page.select_option("select[formcontrolname='rol']", value=str(rol_value))
                         except Exception:
-                            page.select_option("select:has-text('Seleccionar rol')", label="Médico")
+                            page.select_option("select:has-text('Seleccionar rol')", label=rol_nombre)
+                        print(f"    [+] Rol seleccionado: {rol_nombre} ({rol_value})")
                     except Exception as e_rol:
                         print(f"    [i] Advertencia al seleccionar rol: {e_rol}")
 
@@ -336,7 +416,14 @@ def ejecutar_automatizacion():
                             errores += 1
                         else:
                             btn_agregar.click(timeout=2000)
-                            print("    [+] Médico agregado temporalmente (Clic en Agregar).")
+                            print("    [+] Clic en Agregar ejecutado.")
+                            
+                            # 5.0 Validar mensaje de confirmación "Usuario agregado correctamente"
+                            agregado_ok = esperar_alerta(page, "Usuario agregado correctamente")
+                            if agregado_ok:
+                                print("    [+] Confirmación detectada: 'Usuario agregado correctamente'.")
+                            else:
+                                print("    [!] NO se detectó la confirmación 'Usuario agregado correctamente'.")
                             time.sleep(1.5)
                             
                             # 5.1 Clic en Continuar (Confirmar la adición final)
@@ -360,7 +447,14 @@ def ejecutar_automatizacion():
                                 
                             try:
                                 btn_continuar.click(timeout=2000)
-                                print("    [+] Guardado y registro completado (Clic en Continuar).")
+                                print("    [+] Clic en Continuar ejecutado.")
+                                
+                                # 5.1.1 Validar el popup "Personal operativo guardado exitosamente"
+                                guardado_ok = esperar_alerta(page, "guardado exitosamente")
+                                if guardado_ok:
+                                    print("    [+] Confirmación detectada: 'Personal operativo guardado exitosamente'.")
+                                else:
+                                    print("    [!] NO se detectó la confirmación 'Personal operativo guardado exitosamente'.")
                                 time.sleep(2)
                             except Exception as e_cont:
                                 print(f"    [!] Advertencia al hacer clic en Continuar: {e_cont}")
@@ -401,6 +495,31 @@ def ejecutar_automatizacion():
                                     time.sleep(1.5)
                                 except Exception:
                                     time.sleep(2)
+
+                            # 5.3 Eliminar el registro anterior (bote de basura) para poder capturar el siguiente usuario
+                            try:
+                                btn_trash = None
+                                selectores_trash = [
+                                    "button.btn-danger:has(.bi-trash)",
+                                    "button:has(.bi-trash)",
+                                    "i.bi-trash"
+                                ]
+                                for selector in selectores_trash:
+                                    try:
+                                        locator = page.locator(selector).first
+                                        if locator.is_visible(timeout=1500):
+                                            btn_trash = locator
+                                            break
+                                    except Exception:
+                                        continue
+                                if btn_trash is not None:
+                                    btn_trash.click(timeout=2000)
+                                    print("    [+] Registro anterior eliminado (clic en bote de basura).")
+                                    time.sleep(1.5)
+                                else:
+                                    print("    [i] No hay registro anterior para eliminar en la pestaña.")
+                            except Exception as e_trash:
+                                print(f"    [i] Advertencia al eliminar el registro anterior: {e_trash}")
                     except Exception as e_btn:
                         print(f"    [!] Error al interactuar con el botón Agregar: {e_btn}")
                         df.at[index, col_matricula] = "ERROR: Falla botón Agregar"
@@ -419,7 +538,28 @@ def ejecutar_automatizacion():
         # 6. Guardar resultados
         output_file = 'RESULTADO_CARGA_MOCE.xlsx'
         try:
-            df.to_excel(output_file, index=False)
+            df.to_excel(output_file, index=False, engine='openpyxl')
+
+            # Marcar en rojo las CURPs con matrícula no generada o con error
+            from openpyxl import load_workbook
+            from openpyxl.styles import PatternFill
+            wb = load_workbook(output_file)
+            ws = wb.active
+            encabezados = {cell.value: cell.column for cell in ws[1]}
+            red_fill = PatternFill(start_color="00FF0000", end_color="00FF0000", fill_type="solid")
+            if col_matricula in encabezados:
+                col_mat_idx = encabezados[col_matricula]
+                col_curp_idx = encabezados.get(col_curp)
+                for fila in range(2, ws.max_row + 1):
+                    valor = ws.cell(row=fila, column=col_mat_idx).value
+                    es_error = (valor is None or not str(valor).strip()
+                                or "ERROR" in str(valor).upper()
+                                or "NO GENERADA" in str(valor).upper())
+                    if es_error:
+                        ws.cell(row=fila, column=col_mat_idx).fill = red_fill
+                        if col_curp_idx:
+                            ws.cell(row=fila, column=col_curp_idx).fill = red_fill
+            wb.save(output_file)
             print("\n" + "=" * 60)
             print(f">>> PROCESO FINALIZADO <<<")
             print(f" - Registros procesados con éxito: {exitosos}")

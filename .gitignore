@@ -1,0 +1,8 @@
+# Ignorar todo
+*
+
+# No ignorar el archivo principal
+!automatizacion_imss.py
+
+# No ignorar el propio .gitignore
+!.gitignore
